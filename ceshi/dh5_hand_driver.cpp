@@ -683,7 +683,7 @@ private:
     // 可配置参数（需要根据实际硬件标定）
     struct Config {
         uint16_t openPos[6]   = {869, 1706, 1682, 1690, 1687, 854};  // 张开位置（默认值，需标定）
-        uint16_t closePos[6]  = {30, 30, 30, 30, 30, 600}; // 闭合位置（轴2,3反向，需标定）
+        uint16_t closePos[6]  = {30, 30, 30, 30, 30, 600}; // 闭合位置（握拳参考）
         uint16_t speed[6]     = {30, 30, 30, 30, 30, 30};     // 默认速度50%
         uint16_t force[6]     = {60, 60, 60, 60, 60, 60};     // 默认力60%
         int16_t  currentThreshold = 500;  // 电流阈值 (mA)
@@ -857,13 +857,13 @@ public:
     // 
     // 策略说明：
     // 1. 先张开到初始位置
-    // 2. 设置合适的速度和力
-    // 3. 逐步向闭合方向推进（步进式）
-    // 4. 每步检查：堵转立刻停止；电流超阈值则该轴停止推进
-    // 5. 所有轴到位或超时后结束
+    // 2. 拇指预摆位
+    // 3. 四指一次性连续闭合（流畅）
+    // 4. 高频检测电流/堵转，单轴触发后锁住该轴，其他轴继续
+    // 5. 四指都触发停止或超时后结束
     // ========================================================================
-    bool graspBottle(int stepIncrement = 50, int maxSteps = 15) {
-        cout << "🍶 执行动作：抓瓶子（开环 + 电流保护）" << endl;
+    bool graspBottle(int pollIntervalMs = 60, int maxCycles = 180) {
+        cout << "🍶 执行动作：抓瓶子（连续闭合 + 接触停指）" << endl;
 
         // Step 1: 张开到初始位置
         cout << "  📍 Step 1: 张开到初始位置" << endl;
@@ -871,135 +871,159 @@ public:
             cerr << "  ❌ 张开失败" << endl;
             return false;
         }
-        this_thread::sleep_for(chrono::milliseconds(300));
+        this_thread::sleep_for(chrono::milliseconds(250));
 
-        // Step 2: 设置抓取参数（速度慢一些，力适中）
-        uint16_t graspSpeed[6] = {30, 30, 30, 30, 30, 30};
-        uint16_t graspForce[6] = {50, 50, 50, 50, 50, 50};
-        
+        // Step 2: 设置抓取参数（四指速度更快，更接近握拳的流畅感）
+        uint16_t graspSpeed[6] = {35, 30, 30,30, 30, 35};
+        uint16_t graspForce[6] = {55, 55, 55, 55, 55, 55};
+        const int blockedConfirmCount = 2;    // 连续2次堵转再确认
+        const int currentConfirmCount = 2;    // 连续2次过流再确认
+        const int currentRiseThreshold = 90;  // 相对基线电流增量阈值(mA)
+        const int nearTargetTolerance = 12;   // 接近最终目标阈值(0.12mm)
+
         if (!hand.setAxesSpeeds6(graspSpeed)) return false;
         if (!hand.setAxesForces6(graspForce)) return false;
 
-        // Step 3: 拇指预定位（轴1拇指左右 + 轴6拇指上下先到抓取姿态）
+        // Step 3: 拇指预定位（轴1/轴6）
         cout << "  📍 Step 2: 拇指预定位..." << endl;
-        {
-            uint16_t thumbPrePos[6];
-            if (!hand.readAxesPositions6(thumbPrePos)) {
-                cerr << "  ❌ 读取位置失败" << endl;
-                return false;
-            }
-            // 只修改拇指轴，其他保持
-            thumbPrePos[0] = config.closePos[0];  // 轴1 拇指左右到抓取位
-            thumbPrePos[5] = config.closePos[5];  // 轴6 拇指上下到抓取位
-            if (!hand.setAxesPositions6(thumbPrePos)) {
-                cerr << "  ❌ 拇指预定位失败" << endl;
-                return false;
-            }
-            this_thread::sleep_for(chrono::milliseconds(500));
-        }
-
-        // Step 4: 获取当前位置作为起点
         uint16_t currentPos[6];
+        if (!hand.readAxesPositions6(currentPos)) {
+            cerr << "  ❌ 读取位置失败" << endl;
+            return false;
+        }
+        currentPos[0] = config.closePos[0];
+        currentPos[5] = config.closePos[5];
+        if (!hand.setAxesPositions6(currentPos)) {
+            cerr << "  ❌ 拇指预定位失败" << endl;
+            return false;
+        }
+        this_thread::sleep_for(chrono::milliseconds(350));
+
+        // Step 4: 构造连续闭合目标（轴2~5 直接向闭合位运动）
+        uint16_t targetPos[6];
+        memcpy(targetPos, config.closePos, sizeof(targetPos));
         if (!hand.readAxesPositions6(currentPos)) {
             cerr << "  ❌ 读取初始位置失败" << endl;
             return false;
         }
 
-        cout << "  📍 Step 3: 四指逐步推进抓取..." << endl;
+        uint16_t cmdPos[6];
+        memcpy(cmdPos, currentPos, sizeof(cmdPos));
+        cmdPos[0] = targetPos[0];
+        cmdPos[5] = targetPos[5];
+        for (int i = 1; i <= 4; i++) {
+            cmdPos[i] = targetPos[i];
+        }
 
-        // 目标位置（向闭合方向）
-        uint16_t targetPos[6];
-        memcpy(targetPos, config.closePos, sizeof(targetPos));
-
-        // 每轴是否已停止推进（拇指轴已预定位，标记完成）
+        // 每轴是否停止（仅轴2~5参与）
         bool axisFinished[6] = {true, false, false, false, false, true};
+        uint16_t holdPos[6];
+        memcpy(holdPos, currentPos, sizeof(holdPos));
+        holdPos[0] = cmdPos[0];
+        holdPos[5] = cmdPos[5];
+        int blockedCount[6] = {0, 0, 0, 0, 0, 0};
+        int overCurrentCount[6] = {0, 0, 0, 0, 0, 0};
 
-        // Step 5: 分步推进（仅轴2-5四指）
-        for (int step = 0; step < maxSteps; step++) {
-            cout << "    🔹 推进步骤 " << (step + 1) << "/" << maxSteps << endl;
-
-            // 计算本步目标位置
-            uint16_t stepPos[6];
-            for (int i = 0; i < 6; i++) {
-                if (axisFinished[i]) {
-                    stepPos[i] = currentPos[i];  // 保持不动
-                } else {
-                    // 向目标推进一步
-                    if (currentPos[i] < targetPos[i]) {
-                        stepPos[i] = min((int)currentPos[i] + stepIncrement, (int)targetPos[i]);
-                    } else {
-                        stepPos[i] = max((int)currentPos[i] - stepIncrement, (int)targetPos[i]);
-                    }
-                }
-            }
-
-            // 发送位置指令
-            if (!hand.setAxesPositions6(stepPos)) {
-                cerr << "      ❌ 设置位置失败" << endl;
-                return false;
-            }
-
-            // 等待一小段时间让手指运动
-            this_thread::sleep_for(chrono::milliseconds(300));
-
-            // 检查状态
-            uint16_t states[6];
-            if (!hand.readAxisStates6(states)) {
-                cerr << "      ⚠️ 读取状态失败" << endl;
-                continue;
-            }
-
-            // 检查堵转：抓取时堵转说明接触到瓶子，标记该轴完成
-            for (int i = 0; i < 6; i++) {
-                if (states[i] == STATE_BLOCKED && !axisFinished[i]) {
-                    cout << "      🤏 轴" << (i+1) << " 堵转（已接触瓶子），停止推进" << endl;
-                    axisFinished[i] = true;
-                }
-            }
-
-            // 读取电流反馈（只有前5轴）
+        // 记录空载基线电流（轴1~5）
+        int baselineCurrent[5] = {0, 0, 0, 0, 0};
+        {
             int16_t currents[5];
             if (hand.readCurrents5(currents)) {
-                for (int i = 0; i < 5; i++) {
-                    if (abs(currents[i]) > config.currentThreshold && !axisFinished[i]) {
-                        cout << "      ⚡ 轴" << (i+1) << " 电流达到阈值 (" 
-                             << currents[i] << "mA)，停止推进" << endl;
-                        axisFinished[i] = true;
-                    }
-                }
-            }
-
-            // 检查是否到位
-            for (int i = 0; i < 6; i++) {
-                if (states[i] == STATE_ARRIVED && !axisFinished[i]) {
-                    cout << "      ✅ 轴" << (i+1) << " 到位" << endl;
-                    axisFinished[i] = true;
-                }
-            }
-
-            // 读取设备实际反馈位置（而非使用命令位置）
-            if (!hand.readAxesPositions6(currentPos)) {
-                // 读取失败时退回到命令位置
-                memcpy(currentPos, stepPos, sizeof(currentPos));
-            }
-
-            // 检查是否全部完成
-            bool allFinished = true;
-            for (int i = 0; i < 6; i++) {
-                if (!axisFinished[i]) {
-                    allFinished = false;
-                    break;
-                }
-            }
-
-            if (allFinished) {
-                cout << "  ✅ 所有手指已完成抓取" << endl;
-                break;
+                for (int i = 0; i < 5; i++) baselineCurrent[i] = abs(currents[i]);
             }
         }
 
-        cout << "✅ 抓瓶子动作完成" << endl;
-        return true;
+        cout << "  📍 Step 3: 四指连续闭合，接触即停..." << endl;
+        if (!hand.setAxesPositions6(cmdPos)) {
+            cerr << "  ❌ 下发连续闭合目标失败" << endl;
+            return false;
+        }
+
+        // Step 5: 高频轮询，触发后锁定该轴当前位置
+        for (int cycle = 0; cycle < maxCycles; cycle++) {
+            this_thread::sleep_for(chrono::milliseconds(pollIntervalMs));
+
+            uint16_t states[6];
+            if (!hand.readAxisStates6(states)) {
+                continue;
+            }
+            if (!hand.readAxesPositions6(currentPos)) {
+                continue;
+            }
+
+            int16_t currents[5];
+            bool hasCurrent = hand.readCurrents5(currents);
+            bool needResendCommand = false;
+
+            for (int i = 1; i <= 4; i++) {  // 仅轴2~5
+                if (axisFinished[i]) continue;
+
+                bool nearTarget = abs((int)currentPos[i] - (int)targetPos[i]) <= nearTargetTolerance;
+                if (nearTarget) {
+                    axisFinished[i] = true;
+                    holdPos[i] = currentPos[i];
+                    needResendCommand = true;
+                    cout << "      ✅ 轴" << (i+1) << " 接近闭合上限，停止该轴" << endl;
+                    continue;
+                }
+
+                if (states[i] == STATE_BLOCKED) {
+                    blockedCount[i]++;
+                } else {
+                    blockedCount[i] = 0;
+                }
+
+                bool hitCurrent = false;
+                int rise = 0;
+                if (hasCurrent && i < 5) {
+                    int currAbs = abs(currents[i]);
+                    rise = currAbs - baselineCurrent[i];
+                    bool hitHardLimit = currAbs >= config.currentThreshold;
+                    bool hitRiseLimit = rise >= currentRiseThreshold;
+                    hitCurrent = hitHardLimit || hitRiseLimit;
+                    if (hitCurrent) {
+                        overCurrentCount[i]++;
+                    } else {
+                        overCurrentCount[i] = 0;
+                        baselineCurrent[i] = (baselineCurrent[i] * 3 + currAbs) / 4;
+                    }
+                }
+
+                if (blockedCount[i] >= blockedConfirmCount ||
+                    overCurrentCount[i] >= currentConfirmCount) {
+                    axisFinished[i] = true;
+                    holdPos[i] = currentPos[i];
+                    needResendCommand = true;
+                    cout << "      🤏 轴" << (i+1) << " 触发接触停止";
+                    if (hasCurrent && i < 5) {
+                        cout << " (I=" << currents[i]
+                             << "mA, 基线=" << baselineCurrent[i]
+                             << "mA, 增量=" << rise << "mA)";
+                    }
+                    cout << endl;
+                }
+            }
+
+            if (needResendCommand) {
+                for (int i = 1; i <= 4; i++) {
+                    cmdPos[i] = axisFinished[i] ? holdPos[i] : targetPos[i];
+                }
+                if (!hand.setAxesPositions6(cmdPos)) {
+                    cerr << "  ❌ 更新停指目标失败" << endl;
+                    return false;
+                }
+            }
+
+            bool fingersDone = axisFinished[1] && axisFinished[2] &&
+                               axisFinished[3] && axisFinished[4];
+            if (fingersDone) {
+                cout << "  ✅ 四指已接触停止，抓瓶完成" << endl;
+                return true;
+            }
+        }
+
+        cout << "⚠️ 抓瓶超时：未在规定时间内全部触发停止" << endl;
+        return false;
     }
 
     // ========================================================================
@@ -1156,7 +1180,7 @@ int main(int argc, char* argv[]) {
     } else if (action == "bottle" || action == "grasp") {
         cout << "\n--- 执行: 抓瓶子 ---" << endl;
         actions.setCurrentThreshold(600);
-        ok = actions.graspBottle(50, 12);
+        ok = actions.graspBottle(60, 180);
     } else if (action == "demo") {
         cout << "\n--- 演示: 握拳 -> 剪刀 -> 布 ---" << endl;
         ok = actions.fist();
@@ -1184,7 +1208,7 @@ int main(int argc, char* argv[]) {
         }
         cout << endl;
     }
-
+    
     cout << "\n✅ 执行完成！" << endl;
     cout << "\n📝 标定说明：" << endl;
     cout << "  - 默认位置参数可能需要根据实际硬件调整" << endl;
